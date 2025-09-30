@@ -1,0 +1,54 @@
+# Создаем таблицу семейства `netdev` для самой ранней фильтрации.
+table netdev ddos {
+    # ПУСТАЯ ЦЕПОЧКА ДЛЯ ЛОГИРОВАНИЯ
+    # Позволит нам динамически включать логирование того, что блокируется на этом уровне.
+    chain log_dropped_netdev {}
+
+    # Применяем на серверах в DMZ, которые открыты всему интЕрнет. На серверах в DMZ с доступом точка-точка можно не применять.
+    # Главная цепочка, привязанная к хуку `ingress`.
+    # ВАЖНО: ЗАМЕНИТЕ "eth0" на имя вашего основного внешнего сетевого интерфейса!
+    # В этой цепочке происходит самая ранняя фильтрация на уровне драйвера.
+    # Ядру уже известны IP-адреса, но еще нет информации о состоянии соединения (conntrack).
+    # Поэтому здесь нельзя использовать `ct state`, но можно эффективно блокировать по IP.
+    # Надо проводить анализ
+    chain ingress {
+        type filter hook ingress device "eth0" priority -500; policy accept;
+
+        # ПРАВИЛО-ИСКЛЮЧЕНИЕ: Не применяем лимиты к доверенным DPI-сканерам.
+        saddr @dpi_scanners counter return comment "Bypass flood protection for trusted DPI scanners"
+        # NAT ПРАВИЛО: Пропускаем трафик от доверенных NAT в обход защиты от флуда
+        saddr @trusted_nats counter return comment "Bypass flood protection for trusted corporate NATs"
+
+        # ПРАВИЛО: Ограничение ICMP-флуда
+        # Ограничиваем количество ICMP-пакетов ОТ КАЖДОГО ИСТОЧНИКА до 1 в секунду.
+        # Это эффективно отразит атаку типа "ping flood".
+        meta l4proto icmp limit rate over 1/second counter drop comment "Rate-limit per-IP ICMP flood at ingress"
+        meta l4proto icmpv6 icmpv6 type echo-request limit rate over 5/second counter drop comment "Rate-limit per-IP ICMPv6 flood at ingress"        
+
+        # --- ДОБАВЛЯЕМ ДВА ПРАВИЛА БЛОКИРОВКИ ---
+        # 1. Проверяем, не заблокирован ли IP-адрес полностью.
+        saddr @blackhole_ips counter drop comment "Drop traffic from fully blacklisted IPs"        
+
+        # 2. ЗАЩИТА ОТ СПУФИНГА (переехала сюда)
+        iifname != "lo" saddr { 127.0.0.0/8, "::1/128" } counter drop comment "Drop spoofed loopback addresses"
+        saddr { 0.0.0.0/8, 169.254.0.0/16, 192.0.2.0/24, 224.0.0.0/3, 240.0.0.0/5 } counter drop comment "Drop spoofed private/reserved IPv4 subnets"
+        ip6 saddr { fe80::/10, ff00::/8 } counter drop comment "Drop spoofed private/reserved IPv6 subnets"
+
+        # --- ЗАЩИТА ОТ ФЛУДА (DDoS Mitigation) ---
+        # Грубое ограничение TCP SYN-флуда на всем интерфейсе.
+        # Пропускаем не более 1000 новых SYN-пакетов в секунду. Все, что выше - отбрасывается.
+        # Это первая, самая быстрая линия обороны.
+        # Ограничиваем количество SYN-пакетов ОТ КАЖДОГО IP ИСТОЧНИКА до 10 в секунду.
+        # Это более "умная" защита, чем общее ограничение на интерфейс.
+        tcp flags syn limit rate over 10/second burst 20 packets counter drop comment "Rate-limit per-IP SYN flood at ingress"
+
+        # Передаем управление на цепочку логирования. Если она пуста, ничего не произойдет.
+        # Если в ней есть правила, они сработают на пакеты, которые не были отброшены выше.
+        jump log_dropped_netdev
+        # Включить:
+        # sudo nft add rule netdev ddos log_dropped_netdev counter log prefix "[NETDEV:DROPPED] "
+        # Выключить:
+        # sudo nft flush chain netdev ddos log_dropped_netdev
+    }
+}
+

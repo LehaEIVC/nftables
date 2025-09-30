@@ -1,0 +1,10 @@
+table inet raw {
+    chain raw_prerouting {    
+        # `notrack`: Указывает системе не отслеживать соединения для этих портов.
+        # Зачем: Снижает нагрузку на CPU на высоконагруженных серверах, обрабатывающих много мелких пакетов (DNS, NTP).
+        # Для большинства серверов это не обязательно, но является хорошей практикой.
+        #tcp dport { domain, bootps, tftp, ntp, nfs} notrack
+        #udp dport { domain, bootps, tftp, ntp, nfs} notrack
+    }
+}    
+

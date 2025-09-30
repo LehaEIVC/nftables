@@ -1,0 +1,150 @@
+# Объявляем, что все определения в этом файле принадлежат таблице `inet filter`.
+table inet filter {
+
+    # --- Сет для ПОЛНОЙ временной блокировки IP-адресов ---
+    set blackhole_ips {
+        type ipv4_addr, ipv6_addr
+        flags timeout, interval
+        timeout 1d
+        # Как использовать:
+        # Блокирует ВЕСЬ трафик от 1.2.3.4 на 24 часа.
+        # sudo nft add element inet filter blackhole_ips { 1.2.3.4 }
+        # sudo nft add element inet filter blackhole_ips { "2001:db8::dead:beef" }
+    }
+
+    # --- Сет для ТОЧЕЧНОЙ временной блокировки доступа к сервисам ---
+    set blackhole_services {
+        type { ipv4_addr, ipv6_addr } . l4proto . inet_service
+        flags timeout, interval
+        timeout 1h
+        # Как использовать:
+        # Блокирует трафик от 1.2.3.4 только на TCP-порт 80 на 1 час.
+        # sudo nft add element inet filter blackhole_services { 1.2.3.4 . tcp . 80 }
+        # sudo nft add element inet filter blackhole_services { "[2001:db8::1]" . tcp . 80 timeout 10h }
+    }
+
+    # СЕТ для доверенных NAT-адресов, исключенных из-под защиты от флуда ---
+    set trusted_nats {
+        type ipv4_addr, ipv6_addr
+	flags interval
+        elements = {
+            # 11.0.0.0,
+            # 192.168.30.25,
+        }
+    }    
+
+    # --- Сет для доверенных DPI-сканеров, которым разрешен полный доступ ---
+    set dpi_scanners {
+        # Тип данных: хранит IPv4-адреса.
+        type ipv4_addr, ipv6_addr
+	flags interval
+        # Элементы: IP-адреса ваших сканеров уязвимостей.
+        elements = {
+            10.10.100.5, # Например, сервер Qualys
+            10.10.100.6  # Например, сервер Nessus
+            # fe80::1234:5678:9abc:def0 # Пример IPv6-адреса сканера
+        }
+    }
+
+    # --- Сет для предоставления ВРЕМЕННОГО и ТОЧЕЧНОГО доступа ---
+    set tmp_input_policy {
+        # Тип данных: хранит тройку "IP-адрес . Протокол . Порт".
+        type { ipv4_addr, ipv6_addr } . l4proto . inet_service
+
+        # Флаги: таймаут и поддержка диапазонов портов.
+        flags timeout, interval
+        timeout 1d
+
+        # Как использовать (НОВЫЙ СИНТАКСИС):
+        # --- TCP ---
+        # sudo nft add element inet filter tmp_input_policy { 1.2.3.4 . tcp . 8080 timeout 1h }
+        # --- UDP ---
+        # sudo nft add element inet filter tmp_input_policy { 1.2.3.4 . udp . 51820 timeout 4h }
+        # sudo nft add element inet filter tmp_input_policy { 1.2.3.4 . udp . 30000-35000 timeout 2d }
+    }
+
+    # --- Сет для ВРЕМЕННОГО и ТОЧЕЧНОГО ИСХОДЯЩЕГО доступа ---
+    set tmp_output_policy {
+        # Тип данных: тройка "IP-адрес НАЗНАЧЕНИЯ . Протокол . Порт"
+        type { ipv4_addr, ipv6_addr } . l4proto . inet_service
+
+        # Флаги: таймаут и поддержка диапазонов портов.
+        flags timeout, interval
+        timeout 1h # <-- Для временного исходящего доступа 1 час - хороший таймаут по умолчанию
+
+        # Как использовать:
+        # Разрешить серверу обратиться к 1.1.1.1 по TCP на порт 443 на 1 час.
+        # sudo nft add element inet filter tmp_output_policy { 1.1.1.1 . tcp . 443 }
+    }    
+
+    # --- ЕДИНАЯ КАРТА ДОСТУПА ДЛЯ ВСЕХ СЕРВИСОВ (TCP и UDP) ---
+    map input_policy_map {
+        # Тип ключа: тройка "IP-адрес . Протокол L4 . Порт"
+        # Тип значения: вердикт (accept)
+        type { ipv4_addr, ipv6_addr } . l4proto . inet_service : verdict
+        flags interval
+ 
+        elements = {
+            # --- ИНФРАСТРУКТУРНЫЕ СЕРВИСЫ (которые инициализируют соединения к своим агентам на Вашем сервере) ---
+            # Netbackup (TCP)
+            10.10.20.21 . tcp . 13782 : accept,
+            # Zabbix (TCP)
+            10.10.20.10 . tcp . 10050 : accept,
+
+            # SSH для администраторов (TCP)
+            10.10.10.0/24 . tcp . 22 : accept,
+
+            # --- ПРИМЕР: DNS-сервер (UDP и TCP) ---
+            # Для сервера, который предоставляет DNS-сервис (обычные сервера не предоставляют DNS):
+            # 10.0.0.0/8 . udp . 53 : accept,
+            # 10.0.0.0/8 . tcp . 53 : accept,
+
+            # --- ПРИМЕР: NTP-сервер (UDP) ---
+            # Для сервера, который держит NTP-сервис (обычные сервера не предоставляют NTP):
+            # 0.0.0.0/0 . udp . 123 : accept, # NTP часто доступен отовсюду
+
+            # --- БИЗНЕС-СЕРВИСЫ ---
+            # Веб-сервер (TCP)
+            10.0.0.0/8 . tcp . http : accept,
+            10.0.0.0/8 . tcp . https : accept,
+            # Веб-сервер (QUIC/HTTP3, UDP)
+            10.0.0.0/8 . udp . 443 : accept,
+            
+            # PostgreSQL (TCP)
+            10.10.10.0/24 . tcp . 5432 : accept
+        }
+    }
+
+    # --- ЕДИНАЯ КАРТА ДЛЯ РАЗРЕШЕННОГО ИСХОДЯЩЕГО ТРАФИКА ---
+    map output_policy_map {
+        # Тип ключа: тройка "IP-адрес НАЗНАЧЕНИЯ . Протокол L4 . Порт НАЗНАЧЕНИЯ"
+        type { ipv4_addr, ipv6_addr } . l4proto . inet_service : verdict
+        flags interval
+
+        elements = {
+            # --- БАЗОВЫЕ ИНФРАСТРУКТУРНЫЕ СЕРВИСЫ ---
+            # 1. DNS: Разрешаем серверу обращаться к DNS-серверам.
+            10.10.10.1 . udp . 53 : accept,
+            10.10.10.1 . tcp . 53 : accept,
+            # Для ДМЗ: разрешаем ДНС запросы только на яндекс-серверам.
+            # 77.88.8.8 . udp . 53 : accept,
+            # 77.88.8.1 . tcp . 53 : accept,
+
+            # 2. NTP: Разрешаем синхронизацию времени.
+            # ПРИМЕЧАНИЕ: Замените на IP ваших корпоративных или публичных NTP-серверов.
+            10.10.10.2 . udp . 123 : accept,
+            192.168.1.1 . udp . 123 : accept,
+
+            # 3. Zabbix Agent (Active Checks): Разрешаем агенту отправлять данные на Zabbix-сервер.
+            # Zabbix Agent -> Zabbix Server
+            10.10.20.10 . tcp . 10051 : accept,
+
+            # --- ОБНОВЛЕНИЯ И ПАКЕТЫ ---
+            # 4. Репозитории пакетов (HTTP/HTTPS).
+            # Пример для корпоративного зеркала:
+            10.10.50.100 . tcp . http : accept,
+            10.10.50.100 . tcp . https : accept,
+        }
+    }
+}
+

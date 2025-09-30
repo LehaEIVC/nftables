@@ -1,0 +1,211 @@
+# --- Таблица RAW: Предварительная обработка ---
+# Зачем: Используется для исключения трафика из системы отслеживания соединений (conntrack).
+table inet raw {
+    chain prerouting {
+        # filter: тип цепочки; hook prerouting: точка входа (до маршрутизации); priority -300: самый высокий приоритет.
+        type filter hook prerouting priority -300; policy accept;
+        # Передаем управление пользовательской цепочке, определенной в raw.nft
+        jump raw_prerouting
+    }
+}
+
+# --- Таблица MANGLE: Модификация пакетов ---
+# Зачем: Для изменения заголовков пакетов и для ранней отбраковки вредоносных пакетов (сканирование, спуфинг).
+table inet mangle {
+    chain prerouting {
+        # priority -150: выполняется после `raw`.
+        type filter hook prerouting priority -150; policy accept;
+        # Передаем управление пользовательской цепочке, определенной в mangle.nft
+        jump mangle_prerouting
+    }
+}
+
+# --- Таблица FILTER: Основная фильтрация ---
+# inet: работает и для IPv4, и для IPv6.
+table inet filter {
+    # --- ПУСТЫЕ ЦЕПОЧКИ ДЛЯ ЛОГИРОВАНИЯ ---
+    chain log_accepted_input {}
+    chain log_accepted_output {}
+    chain log_dropped_input {}
+    chain log_dropped_output {}
+    chain log_accepted_forward {}
+    chain log_dropped_forward {}    
+    chain log_dropped_netdev {}
+
+    chain prerouting {
+        type filter hook prerouting priority 0; policy accept;
+
+        # 1. Проверяем, не заблокирован ли доступ к конкретному сервису.
+        saddr . meta l4proto . th dport @blackhole_services counter drop comment "Drop traffic to specific blacklisted services"
+    }
+
+    # Цепочка для входящего трафика, предназначенного самому серверу.
+    chain input {
+        # `policy drop`: Политика по умолчанию. "Запрещено всё, что не разрешено явно".
+        # Это краеугольный камень безопасности файрвола.
+        type filter hook input priority 0; policy drop;
+
+        # --- Основные разрешающие правила ---
+        # Разрешает трафик для уже установленных или связанных соединений. Самое важное правило для работы stateful-файрвола.
+        ct state related,established counter accept comment "Accept traffic connections"
+        # Разрешает любой трафик с/на loopback-интерфейс (lo). Необходимо для работы многих локальных сервисов.
+        iifname lo accept comment "Accept any localhost traffic"
+        # Отбрасывает пакеты, которые не могут быть идентифицированы системой отслеживания соединений. Защита от некоторых видов атак.
+        ct state invalid counter drop comment "Drop in valid connections"
+        # Разрешает протокол IGMP (для multicast-трафика). Если небходим - раскомментировать. Обычно используется для потоковых данных (например IPTV) или кластерных систем.
+        # ip protocol igmp accept comment "Accept IGMP"
+
+        # ПРАВИЛО-ИСКЛЮЧЕНИЕ: Если пакет пришел от доверенного DPI-сканера,
+        # немедленно принимаем его, предоставляя доступ ко всем портам.
+        # Это правило должно быть здесь, чтобы обойти все последующие `jump` и политику `drop`.
+        saddr @dpi_scanners counter accept comment "Allow all access for trusted DPI scanners"
+
+        # --- Правила для ICMP (ping и служебные сообщения) ---
+        # Разрешает критически важные ICMP-сообщения, необходимые для корректной диагностики сети.
+        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } accept comment "Accept critical ICMP types"
+        # Перенесен в netdev
+        ## Разрешает "пинг" (echo-request), но ограничивает его частоту (не более 1 пакета в секунду) для защиты от ICMP-флуда.
+        #ip protocol icmp icmp type echo-request limit rate 1/second burst 3 packets accept comment "Rate-limit ICMP echo-request"
+
+        ip6 nexthdr icmpv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept comment "Accept critical ICMPv6 types"
+        # Перенесен в netdev
+        ## Разрешает "пинг" для IPv6 с ограничением скорости.
+        #ip6 nexthdr icmpv6 icmpv6 type echo-request limit rate 1/second burst 3 packets accept comment "Rate-limit ICMPv6 echo-request"
+
+        # Включить логирование разрешенного входящего трафика. В примере логируем разрешенный входящий трафик на 22 порт.
+        # sudo nft add rule inet filter log_accepted_traffic meta l3proto {ip, ip6} ip saddr . meta l4proto . th dport @input_policy_map tcp dport 22 counter log prefix "[INPUT-22:ACCEPTED] " level info
+        # Выключить логирование (просто очистить цепочку):
+        # sudo nft flush chain inet filter log_accepted_traffic
+        jump log_accepted_input
+
+        # --- Переход к правилам для сервисов ---
+        # ЕДИНОЕ ПРАВИЛО ДОСТУПА ДЛЯ ВСЕХ СЕРВИСОВ (TCP и UDP)
+        # Это правило берет IP источника, протокол L4 и порт назначения из пакета
+        # и ищет их комбинацию в нашей единой карте доступа.
+        # `th dport` - это "transport header destination port", работает и для TCP, и для UDP.
+        saddr . meta l4proto . th dport @input_policy_map counter accept comment "Allow services based on the unified access policy map"
+
+        # Правило для временного TCP-доступа
+        saddr . meta l4proto . th dport @tmp_input_policy counter accept comment "Accept for temporary access policy (TCP/UDP)"
+
+        # Включить логирование блокирования
+        # sudo nft add rule inet filter log_dropped_input counter log prefix "[INPUT:BLOCKED] " level warn
+        # Включить логирование блокированных пакетов на 22 порт        
+        # sudo nft add rule inet filter log_dropped_input tcp dport 22 counter log prefix "[INPUT-22:BLOCKED] " level warn
+        #      посмотреть лог: sudo journalctl -fk | grep "INPUT-22:BLOCKED"
+        # Логируем заблокированные пакеты на порт 22, но ТОЛЬКО от источника 1.2.3.4
+        # sudo nft add rule inet filter log_dropped_input ip saddr 1.2.3.4 tcp dport 22 counter log prefix "[DEBUG-SSH-BLOCK] "
+        # Выключить логирование (просто очистить цепочку):
+        # sudo nft flush chain inet filter log_dropped_input
+        jump log_dropped_input
+    }
+
+    # Цепочка для транзитного трафика (сервер как роутер).
+    chain forward {
+        # `policy drop`: Критически важно! Запрещает серверу пересылать трафик по умолчанию.
+        type filter hook forward priority 0; policy drop;
+
+        # --- ОБЩЕЕ ПРАВИЛО ДЛЯ ВСЕХ КОНТЕЙНЕРНЫХ СРЕД ---
+        # Это самое важное правило. Оно разрешает обратный трафик для уже установленных
+        # соединений. Без него ни один контейнер не сможет получить ответ из интернета.
+        # Раскомментируйте его в первую очередь при работе с Docker или Kubernetes.
+        #
+        # ct state related,established counter accept
+
+        # --- ДИНАМИЧЕСКОЕ ЛОГИРОВАНИЕ РАЗРЕШЕННОГО ТРАФИКА ---
+        # Позволяет отлаживать, какой именно транзитный трафик разрешен.
+        jump log_accepted_forward
+
+        # =================================================================================
+        # ===                ПРАВИЛА ДЛЯ DOCKER (выберите нужные)                      ===
+        # =================================================================================
+        #
+        # ПРИМЕЧАНИЕ: Имена интерфейсов могут отличаться. Проверьте их командой `ip a`.
+        # "eth0" - имя вашего основного внешнего интерфейса.
+        # "docker0" - стандартное имя моста (bridge) Docker.
+        #
+        # --- Разрешаем контейнерам Docker выходить в интернет ---
+        # iifname "docker0" oifname "eth0" counter accept
+        #
+        # --- Разрешаем трафику извне попадать в контейнеры через опубликованные порты (-p) ---
+        # iifname "eth0" oifname "docker0" counter accept
+        #
+        # --- Разрешаем контейнерам общаться друг с другом через мост docker0 ---
+        # iifname "docker0" oifname "docker0" counter accept
+
+
+        # =================================================================================
+        # ===              ПРАВИЛА ДЛЯ KUBERNETES (выберите нужные)                    ===
+        # =================================================================================
+        #
+        # ВАЖНО: Имена интерфейсов в Kubernetes СИЛЬНО ЗАВИСЯТ от используемого CNI-плагина
+        # (Calico, Flannel, Cilium и т.д.). Приведенные ниже имена - это ЧАСТЫЕ ПРИМЕРЫ.
+        # Обязательно проверьте актуальные имена командой `ip a` на вашем узле кластера.
+        #
+        # "cni0"    - частое имя для основного моста CNI.
+        # "flannel.1" - интерфейс, создаваемый Flannel.
+        # "cali+"   - маска для интерфейсов, создаваемых Calico (например, cali123456789). `+` - это wildcard.
+        #
+        # --- Разрешаем подам выходить в интернет ---
+        # iifname "cni0" oifname "eth0" counter accept
+        #
+        # --- Разрешаем трафику извне попадать в поды через сервисы (NodePort, LoadBalancer) ---
+        # iifname "eth0" oifname "cni0" counter accept
+        #
+        # --- Разрешаем межподовое общение (Pod-to-Pod) ---
+        # Для Calico:
+        # iifname "cali+" oifname "cali+" counter accept
+        #
+        # Для многих других CNI через мост:
+        # iifname "cni0" oifname "cni0" counter accept
+
+        # --- ДИНАМИЧЕСКОЕ ЛОГИРОВАНИЕ ЗАБЛОКИРОВАННОГО ТРАФИКА ---
+        # Стоит в конце. Сработает для всего, что не было разрешено выше.
+        jump log_dropped_forward
+        # Включаем логирование заблокированного транзитного трафика
+        # sudo nft add rule inet filter log_dropped_forward counter log prefix "[FORWARD:DROPPED] "
+        # Пытаемся запустить `apt update` в контейнере и смотрим логи
+        # sudo journalctl -fk | grep "FORWARD:DROPPED"
+    }
+
+    # Цепочка для исходящего трафика (от самого сервера).
+    chain output {
+        # `policy accept`: Стандартная практика для серверов. Разрешает все исходящие соединения.
+        #type filter hook output priority 0; policy accept;
+
+        # 1. МЕНЯЕМ ПОЛИТИКУ НА DROP: Запрещаем все исходящие соединения по умолчанию.
+        # Это критически важное изменение для реализации egress filtering.
+        type filter hook output priority 0; policy drop;
+
+        # 2. РАЗРЕШАЕМ БАЗОВЫЕ ВЕЩИ (ОБЯЗАТЕЛЬНО!)
+        # Разрешаем исходящий трафик для уже установленных соединений. Без этого не будет работать ни одно TCP-соединение.
+        ct state related,established counter accept comment "Allow established outgoing connections"
+        # Разрешаем любой исходящий трафик на loopback-интерфейс.
+        oifname lo accept comment "Allow any localhost outgoing traffic"
+
+        # Включить логирование разрешенного исходящего трафика. В примере логируем исходящий трафик на zabbix-сервер
+        # sudo nft add rule inet filter log_accepted_output meta l3proto {ip, ip6} ip daddr . meta l4proto . th dport @output_policy_map tcp dport 10051 counter log prefix "[OUTPUT-10051:ACCEPTED] " level info
+        # Выключить логирование (просто очистить цепочку):
+        # sudo nft flush chain inet filter log_accepted_output
+        jump log_accepted_output
+
+        # 3. ИСПОЛЬЗУЕМ КАРТУ ДЛЯ РАЗРЕШЕНИЯ ЛЕГИТИМНОГО ТРАФИКА
+        # Это правило проверяет IP назначения, протокол и порт назначения пакета
+        # по нашей карте разрешенных исходящих соединений.
+        daddr . meta l4proto . th dport @output_policy_map counter accept comment "Allow legitimate outgoing traffic based on egress policy map"
+
+        # 4. НОВОЕ: Правило для ВРЕМЕННОГО исходящего доступа ---
+        # Проверяем, соответствует ли пакет временной политике.
+        daddr . meta l4proto . th dport @tmp_output_policy counter accept comment "Allow temporary outgoing traffic"
+
+        # Включить логирование блокировки исходящего трафика
+        # sudo nft add rule inet filter log_dropped_output counter log prefix "[OUTPUT:BLOCKED] " level warn
+        # Включить логирование блокированных пакетов на host 10.10.30.5
+        # sudo nft add rule inet filter log_dropped_output tcp daddr 10.10.30.5 counter log prefix "[OUTPUT-10.10.30.5:BLOCKED] " level warn
+        #      посмотреть лог: sudo journalctl -fk | grep "OUTPUT-10.10.30.5:BLOCKED"
+        # Выключить логирование (просто очистить цепочку):
+        # sudo nft flush chain inet filter log_dropped_output
+        jump log_dropped_output
+    }
+}
+

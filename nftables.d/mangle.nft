@@ -1,0 +1,46 @@
+table inet mangle {
+    chain mangle_prerouting {
+        # ПРАВИЛО-ИСКЛЮЧЕНИЕ: Если пакет пришел от доверенного DPI-сканера,
+        # немедленно прекращаем обработку этой цепочки и переходим к следующей таблице (filter).
+        # `return` - это "мягкий" выход, который пропускает пакет дальше по сетевому стеку.
+        ip saddr @dpi_scanners return comment "Bypass scan detection for trusted DPI scanners"
+
+        # Пренесли в netdev
+        ## Защита от спуфинга: пакеты с адресом 127.0.0.0/8 не должны приходить извне.
+        #iifname != "lo" ip saddr 127.0.0.0/8 counter drop comment "These rules assume that your loopback interface"
+        ## Защита от спуфинга: блокируем пакеты с зарезервированными/частными IP-адресами, если они приходят из интернета.
+        #ip saddr { 0.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.2.0/24,224.0.0.0/3,240.0.0.0/5} counter drop comment "Block Packets From Private Subnets (Spoofing)"
+        #ip6 saddr { ::1/128, fe80::/10, ff00::/8 } counter drop comment "Drop spoofed IPv6 special networks"
+
+        # NAT ПРАВИЛО: Пропускаем трафик от доверенных NAT в обход защиты от флуда (т.к. за одним IP "сидят" множество пользователей)
+        saddr @trusted_nats counter return comment "Bypass flood protection for trusted corporate NATs"
+
+        # ЗАЩИТА ОТ ФЛУДА (DDoS Mitigation) - на уровне TCP-сессий
+        # Ограничение новых TCP-соединений. Нужно администратору "осознать" эти значения и подобрать. Если будут вопросы, задавайте, обсудим.
+        # --- Как "осознать" эти значения и ввести их в эксплуатацию?
+        # Начните с высоких значений: Раскомментируйте правила, но установите щедрые лимиты, например limit rate 100/second burst 200 packets.
+        # Включите логирование: Временно добавьте правило для логирования отброшенных пакетов (перед правилосм по ограничению новых TCP-соединений), 
+        # чтобы видеть, не блокируете ли вы кого-то по ошибке:
+        # ct state new log prefix "SYN-FLOOD-DROPPED: " limit rate 100/second burst 200 packets counter drop
+        # Наблюдайте: В течение нескольких дней наблюдайте за логами. Если вы не видите ложных срабатываний, можно постепенно снижать лимиты до более разумных значений (10-20/сек — хороший старт для большинства веб-серверов).
+        # Уберите логирование: После настройки уберите правило с log, оставив только drop.
+        # --- правила по ограничению новых TCP-соединений;
+        # ct state new tcp flags & syn != 0 limit rate 10/second burst 20 packets counter accept comment "Rate-limit TCP SYN flood"
+        # ct state new counter drop comment "Drop excessive new connections"
+
+        # Универсальная защита от некорректных TCP-пакетов
+        ip frag-off & 0x1fff != 0 counter drop comment "Drop fragmented packets"
+        ct state new tcp flags & (syn|ack|rst|fin) != syn counter drop comment "Drop invalid new TCP connection attempts"
+        tcp flags & (fin|syn|rst|psh|ack|urg) == 0x0 counter drop comment "Drop NULL packet"
+        tcp flags & (fin|syn|rst|psh|ack|urg) == (fin|syn|rst|psh|ack|urg) counter drop comment "Drop XMAS packet"
+
+        # Блокируем пакеты с бессмысленными комбинациями флагов. 
+        # Некоторые комбинации TCP-флагов технически не запрещены, но абсолютно бессмысленны в реальном мире и почти всегда указывают на попытку сканирования или обхода файрвола.
+        tcp flags & (syn|fin) == (syn|fin) counter drop comment "Drop SYN+FIN"
+        tcp flags & (syn|rst) == (syn|rst) counter drop comment "Drop SYN+RST"
+        
+        # Защита от уязвимостей
+        ct state new tcp option maxseg size 1-535 counter drop comment "Block tiny MSS (SACK Panic Protection)"
+    }
+}
+
