@@ -803,13 +803,6 @@ table inet mangle {
         # `return` - это "мягкий" выход, который пропускает пакет дальше по сетевому стеку.
         ip saddr @dpi_scanners return comment "Bypass scan detection for trusted DPI scanners"
 
-        # Пренесли в netdev
-        ## Защита от спуфинга: пакеты с адресом 127.0.0.0/8 не должны приходить извне.
-        #iifname != "lo" ip saddr 127.0.0.0/8 counter drop comment "These rules assume that your loopback interface"
-        ## Защита от спуфинга: блокируем пакеты с зарезервированными/частными IP-адресами, если они приходят из интернета.
-        #ip saddr { 0.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.2.0/24,224.0.0.0/3,240.0.0.0/5} counter drop comment "Block Packets From Private Subnets (Spoofing)"
-        #ip6 saddr { ::1/128, fe80::/10, ff00::/8 } counter drop comment "Drop spoofed IPv6 special networks"
-
         # NAT ПРАВИЛО: Пропускаем трафик от доверенных NAT в обход защиты от флуда (т.к. за одним IP "сидят" множество пользователей)
         saddr @trusted_nats counter return comment "Bypass flood protection for trusted corporate NATs"
 
@@ -919,7 +912,7 @@ table netdev ddos {
         # Это первая, самая быстрая линия обороны.
         # Ограничиваем количество SYN-пакетов ОТ КАЖДОГО IP ИСТОЧНИКА до 10 в секунду.
         # Это более "умная" защита, чем общее ограничение на интерфейс.
-        tcp flags syn limit rate over 10/second burst 20 packets counter drop comment "Rate-limit per-IP SYN flood at ingress"
+        tcp flags syn limit rate over 1000/second burst 2000 packets counter drop comment "Rate-limit per-IP SYN flood at ingress"
 
         # Передаем управление на цепочку логирования. Если она пуста, ничего не произойдет.
         # Если в ней есть правила, они сработают на пакеты, которые не были отброшены выше.
